@@ -1,0 +1,1 @@
+remixd -s C:\Users\pavor\Desktop\SmartContracts\StellarDiamond\Code --remix-ide http://remix.ethereum.org/#optimize=false&runs=200&evmVersion=null&version=soljson-v0.8.1+commit.df193b15.js
