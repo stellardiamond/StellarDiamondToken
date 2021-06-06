@@ -74,10 +74,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		_addressesExcludedFromTransactionLimit[_burnWallet] = true;
 		
 		// Initialize PancakeSwap V2 router and XLD <-> BNB pair
-		_pancakeSwapRouterAddress = routerAddress; //Value should be: 0x10ed43c718714eb63d5aa57b78b54704e256024e
-		_pancakeswapV2Router = IPancakeRouter02(_pancakeSwapRouterAddress);
-		_pancakeswapV2Pair = IPancakeFactory(_pancakeswapV2Router.factory()).createPair(address(this), _pancakeswapV2Router.WETH());
-		
+		setPancakeSwapRouter(routerAddress);
 
 		emit Transfer(address(0), _msgSender(), _totalTokens);
 
@@ -91,6 +88,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		_isFeeEnabled = true;
 		_maxTransactionAmount = _totalTokens / 100; // only 1% of the total supply can be exchanged at once
 	}
+
 
 	function balanceOf(address account) public view override returns (uint256) {
 		// Apply the distribution rate.  This rate decreases every time a distribution fee is applied, making the balance of every holder go up
@@ -383,6 +381,11 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		return true;
 	}
 
+	function setPancakeSwapRouter(address routerAddress) public onlyOwner {
+		_pancakeSwapRouterAddress = routerAddress; //Value will be: 0x10ed43c718714eb63d5aa57b78b54704e256024e
+		_pancakeswapV2Router = IPancakeRouter02(_pancakeSwapRouterAddress);
+		_pancakeswapV2Pair = IPancakeFactory(_pancakeswapV2Router.factory()).createPair(address(this), _pancakeswapV2Router.WETH());
+	}
 
 	function nextAvailableClaimDate(address ofAddress) public view returns (uint256) {
 		return _nextAvailableClaimDate[ofAddress];
