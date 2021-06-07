@@ -60,7 +60,6 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	event Swapped(uint256 tokensSwapped, uint256 bnbReceived, uint256 tokensIntoLiqudity, uint256 bnbIntoLiquidity);
 	event BNBClaimed(address recipient, uint256 bnbReceived, uint256 nextAvailableClaimDate);
 	
-	
 	constructor (address routerAddress) {
 		_balances[_msgSender()] = _totalDistributionAvailable;
 		
@@ -239,10 +238,8 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		// The amount parameter includes both the liquidity and the reward tokens, we need to find the correct portion for each one so that they are allocated accordingly
 		// Inverse rates to avoid floating point result
 		uint256 liquidityRatio = _poolFee / _liquidityFee;
-		uint256 rewardRatio = _poolFee / _rewardFee;
-		
 		uint256 tokensReservedForLiquidity = amount / liquidityRatio;
-		uint256 tokensReservedForReward = amount / rewardRatio;
+		uint256 tokensReservedForReward = amount - tokensReservedForLiquidity;
 
 		// For the liquidity portion, half of it will be swapped for BNB and the other half will be used to add the BNB into the liquidity
 		uint256 tokensToSwapForLiquidity = tokensReservedForLiquidity / 2;
