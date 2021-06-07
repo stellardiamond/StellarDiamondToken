@@ -239,9 +239,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 
 	function executeSwap(uint256 amount) private {
 		// The amount parameter includes both the liquidity and the reward tokens, we need to find the correct portion for each one so that they are allocated accordingly
-		// Inverse rates to avoid floating point result
-		uint256 liquidityRatio = _poolFee / _liquidityFee;
-		uint256 tokensReservedForLiquidity = amount / liquidityRatio;
+		uint256 tokensReservedForLiquidity = amount * _liquidityFee / _poolFee;
 		uint256 tokensReservedForReward = amount - tokensReservedForLiquidity;
 
 		// For the liquidity portion, half of it will be swapped for BNB and the other half will be used to add the BNB into the liquidity
@@ -253,10 +251,10 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		uint256 bnbSwapped = swapTokensForBNB(tokensToSwap);
 		
 		// Calculate what portion of the swapped BNB is for liquidity and supply it using the other half of the token liquidity portion.  The remaining BNBs in the contract represent the reward pool
-		uint256 bnbLiquidityRatio = tokensToSwap / tokensToSwapForLiquidity;
-		uint256 bnbToBeAddedToLiquidity = bnbSwapped / bnbLiquidityRatio;
-		_pancakeswapV2Router.addLiquidityETH{value: bnbToBeAddedToLiquidity}(address(this), tokensToAddAsLiquidity, 0, 0, owner(), block.timestamp + 360);
-
+		uint256 bnbToBeAddedToLiquidity = bnbSwapped * tokensToSwapForLiquidity / tokensToSwap;
+		(,uint bnbAddedToLiquidity,) = _pancakeswapV2Router.addLiquidityETH{value: bnbToBeAddedToLiquidity}(address(this), tokensToAddAsLiquidity, 0, 0, owner(), block.timestamp + 360);
+		_totalBNBLiquidityAddedFromFees += bnbAddedToLiquidity;
+		
 		emit Swapped(tokensToSwap, bnbSwapped, tokensToAddAsLiquidity, bnbToBeAddedToLiquidity);
 	}
 	
