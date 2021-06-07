@@ -17,10 +17,10 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	string private constant _name = "Stellar Diamond";
 	string private constant _symbol = "XLD";
 	uint8 private constant _decimals = 9;
-	uint8 private constant _distributionFee = 1; //1% of each transaction will be distributed to all holders
-	uint8 private constant _liquidityFee = 4; //4% of each transaction will be added as liquidity
-	uint8 private constant _rewardFee = 8; //8% of each transaction will be used for BNB reward pool
-	uint8 private constant _poolFee = _rewardFee + _liquidityFee; //The total fee to be taken and added to the pool, this includes both the liquidity fee and the reward fee
+	uint8 private _distributionFee; //1 of each transaction that will be distributed to all holders
+	uint8 private _liquidityFee; //% of each transaction that will be added as liquidity
+	uint8 private _rewardFee; //% of each transaction that will be used for BNB reward pool
+	uint8 private _poolFee; //The total fee to be taken and added to the pool, this includes both the liquidity fee and the reward fee
 
 	uint256 private constant _totalTokens = 1000000000000000 * 10**_decimals;	//1 quadrillion total supply
 	mapping (address => uint256) private _balances; //The balance of each address.  This is before applying distribution rate.  To get the actual balance, see balanceOf() method
@@ -74,6 +74,9 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		
 		// Initialize PancakeSwap V2 router and XLD <-> BNB pair
 		setPancakeSwapRouter(routerAddress);
+
+		// 4% liquidity fee, 8% reward fee, 1% distribution fee
+		setFees(4, 8, 1);
 
 		emit Transfer(address(0), _msgSender(), _totalTokens);
 
@@ -382,6 +385,21 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		_pancakeSwapRouterAddress = routerAddress; //Value will be: 0x10ed43c718714eb63d5aa57b78b54704e256024e
 		_pancakeswapV2Router = IPancakeRouter02(_pancakeSwapRouterAddress);
 		_pancakeswapV2Pair = IPancakeFactory(_pancakeswapV2Router.factory()).createPair(address(this), _pancakeswapV2Router.WETH());
+	}
+
+	function setFees(uint8 liquidityFee, uint8 rewardFee, uint8 distributionFee) public onlyOwner 
+	{
+		require(liquidityFee >= 1 && liquidityFee <= 6 , "Liquidity fee must be between 1 and 6");
+		require(rewardFee >= 1 && rewardFee <= 15 , "Reward fee must be between 1 and 6");
+		require(distributionFee >= 1 && distributionFee <= 2, "Distribution fee must be between 1 and 2");
+		require(liquidityFee + rewardFee + distributionFee <= 15, "Total fees cannot exceed 15%");
+
+		_distributionFee = distributionFee;
+		_liquidityFee = liquidityFee;
+		_rewardFee = rewardFee;
+		
+		// Enforce invariant
+		_poolFee = _rewardFee + _liquidityFee;
 	}
 
 	function nextAvailableClaimDate(address ofAddress) public view returns (uint256) {
