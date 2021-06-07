@@ -17,9 +17,9 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	string private constant _name = "Stellar Diamond";
 	string private constant _symbol = "XLD";
 	uint8 private constant _decimals = 9;
-	uint8 private constant _distributionFee = 2; //2% of each transaction will be distributed to all holders
+	uint8 private constant _distributionFee = 1; //1% of each transaction will be distributed to all holders
 	uint8 private constant _liquidityFee = 4; //4% of each transaction will be added as liquidity
-	uint8 private constant _rewardFee = 4; //4% of each transaction will be used for BNB reward pool
+	uint8 private constant _rewardFee = 8; //8% of each transaction will be used for BNB reward pool
 	uint8 private constant _poolFee = _rewardFee + _liquidityFee; //The total fee to be taken and added to the pool, this includes both the liquidity fee and the reward fee
 
 	uint256 private constant _totalTokens = 1000000000000000 * 10**_decimals;	//1 quadrillion total supply
@@ -32,7 +32,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	address private constant _burnWallet = 0x000000000000000000000000000000000000dEaD; //The address that keeps track of all tokens burned
 	uint256 private constant _tokenSwapThreshold = _totalTokens / 100000; //There should be at least 0.0001% of the total supply in the contract before triggering a swap
 	uint256 private constant _rewardCyclePeriod = 1 days; // The duration of the reward cycle (e.g. can claim rewards once a day)
-	uint256 private constant _rewardCycleExtensionThreshold = 20; // If someone receives more than 20% of their balance in a transaction, their reward cycle date will increase accordingly
+	uint256 private constant _rewardCycleExtensionThreshold = 20; // If someone sends or receives more than 20% of their balance in a transaction, their reward cycle date will increase accordingly
 	uint256 private _totalFeesDistributed; // The total fees distributed (in number of tokens)
 	uint256 private _totalFeesPooled; // The total fees pooled (in number of tokens)
 	uint256 private _totalBNBLiquidityAddedFromFees; // The total number of BNB added to the pool through fees
