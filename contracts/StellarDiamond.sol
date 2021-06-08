@@ -17,7 +17,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	string private constant _name = "Stellar Diamond";
 	string private constant _symbol = "XLD";
 	uint8 private constant _decimals = 9;
-	uint8 private _distributionFee; //1 of each transaction that will be distributed to all holders
+	uint8 private _distributionFee; //% of each transaction that will be distributed to all holders
 	uint8 private _liquidityFee; //% of each transaction that will be added as liquidity
 	uint8 private _rewardFee; //% of each transaction that will be used for BNB reward pool
 	uint8 private _poolFee; //The total fee to be taken and added to the pool, this includes both the liquidity fee and the reward fee
@@ -32,7 +32,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	address private constant _burnWallet = 0x000000000000000000000000000000000000dEaD; //The address that keeps track of all tokens burned
 	uint256 private constant _tokenSwapThreshold = _totalTokens / 100000; //There should be at least 0.0001% of the total supply in the contract before triggering a swap
 	uint256 private constant _rewardCyclePeriod = 1 days; // The duration of the reward cycle (e.g. can claim rewards once a day)
-	uint256 private constant _rewardCycleExtensionThreshold = 20; // If someone sends or receives more than 20% of their balance in a transaction, their reward cycle date will increase accordingly
+	uint256 private _rewardCycleExtensionThreshold; // If someone sends or receives more than a % of their balance in a transaction, their reward cycle date will increase accordingly
 	uint256 private _totalFeesDistributed; // The total fees distributed (in number of tokens)
 	uint256 private _totalFeesPooled; // The total fees pooled (in number of tokens)
 	uint256 private _totalBNBLiquidityAddedFromFees; // The total number of BNB added to the pool through fees
@@ -41,7 +41,9 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	mapping(address => uint256) private _nextAvailableClaimDate; // The next available reward claim date for each address
 	mapping(address => uint256) private _rewardsClaimed; // The amount of BNB claimed by each address
 	uint256 private _totalDistributionAvailable = (MAX - (MAX % _totalTokens)); //Indicates the amount of distribution available. Min value is _totalTokens. This is divisible by _totalTokens without any remainder
-
+	uint private _claimRewardGasFeeEstimation; // This is an estimated amount of gas fee for claiming a reward, so that the contract can refund the gas for small rewards. 
+	uint256 private _claimRewardGasFeeRefundThreshold; // If someone has less tokens than this threshold, they will be refunded the gas fee when they claim a reward
+	
 	// CHARITY
 	address payable private constant _charityAddress = payable(0x220fFf82900427d0ce6EE7fDE1BeB53cAD34E8E7); // A percentage of the BNB pool will go to the charity address
 	uint256 private constant _charityThreshold = 1 ether; // The minimum number of BNB reward before triggering a charity call.  This means if reward is lower, it will not contribute to charity
@@ -51,7 +53,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	uint256 private _maxTransactionAmount = _totalTokens; // The amount of tokens that can be exchanged at once
 	mapping (address => bool) private _addressesExcludedFromTransactionLimit; // The list of addresses that are not affected by the transaction limit
 
-	// PANCAKESWAP INTERFACES
+	// PANCAKESWAP INTERFACES (For swaps)
 	address private _pancakeSwapRouterAddress;
 	IPancakeRouter02 private _pancakeswapV2Router;
 	address private _pancakeswapV2Pair;
@@ -72,11 +74,17 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		_addressesExcludedFromTransactionLimit[address(this)] = true;
 		_addressesExcludedFromTransactionLimit[_burnWallet] = true;
 		
-		// Initialize PancakeSwap V2 router and XLD <-> BNB pair
+		// Initialize PancakeSwap V2 router and XLD <-> BNB pair.  Router address will be: 0x10ed43c718714eb63d5aa57b78b54704e256024e
 		setPancakeSwapRouter(routerAddress);
 
 		// 4% liquidity fee, 8% reward fee, 1% distribution fee
 		setFees(4, 8, 1);
+
+		// If someone sends or receives more than 20% of their balance in a transaction, their reward cycle date will increase accordingly
+		setRewardCycleExtensionThreshold(20);
+
+		// Gas fee options for claiming a reward: Balances with less than 0.01% of supply will have their gas fee refunded when claiming a reward
+		setClaimRewardGasFeeOptions(_totalTokens / 10000, 1000000000000000);
 
 		emit Transfer(address(0), _msgSender(), _totalTokens);
 
@@ -88,7 +96,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	function activate() public onlyOwner {
 		_isSwapEnabled = true;
 		_isFeeEnabled = true;
-		_maxTransactionAmount = _totalTokens / 100; // only 1% of the total supply can be exchanged at once
+		setTransactionLimit(100); // only 1% of the total supply can be exchanged at once
 	}
 
 
@@ -253,6 +261,8 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		// Calculate what portion of the swapped BNB is for liquidity and supply it using the other half of the token liquidity portion.  The remaining BNBs in the contract represent the reward pool
 		uint256 bnbToBeAddedToLiquidity = bnbSwapped * tokensToSwapForLiquidity / tokensToSwap;
 		(,uint bnbAddedToLiquidity,) = _pancakeswapV2Router.addLiquidityETH{value: bnbToBeAddedToLiquidity}(address(this), tokensToAddAsLiquidity, 0, 0, owner(), block.timestamp + 360);
+
+		// Keep track of how many BNB were added to liquidity this way
 		_totalBNBLiquidityAddedFromFees += bnbAddedToLiquidity;
 		
 		emit Swapped(tokensToSwap, bnbSwapped, tokensToAddAsLiquidity, bnbToBeAddedToLiquidity);
@@ -306,7 +316,6 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		require(sent, "Reward transaction failed");
 	}
 
-
 	// This function calculates how much (and if) the reward cycle of an address should increase based on its current balance and the amount transferred in a transaction
 	function calculateRewardCycleExtension(uint256 balance, uint256 amount) public view returns (uint256) {
 		uint256 basePeriod = rewardCyclePeriod();
@@ -318,7 +327,7 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 			return block.timestamp + basePeriod;
 		}
 
-		uint256 rate = amount / balance * 100;
+		uint256 rate = amount * 100 / balance;
 
 		// Depending on the % of $XLD tokens transferred, relative to the balance, we might need to extend the period
 		if (rate >= _rewardCycleExtensionThreshold) {
@@ -345,7 +354,19 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		uint256 bnbPool =  address(this).balance;
 
 		// If an address is holding X percent of the supply, then it can claim up to X percent of the reward pool
-		return bnbPool * balance / holdersAmount;
+		uint256 reward = bnbPool * balance / holdersAmount;
+
+		// Low-balance addresses will have their fee refunded when claiming a reward
+		if (balance < _claimRewardGasFeeRefundThreshold) 
+		{
+			uint256 estimatedGasFee = claimRewardGasFeeEstimation();
+			if (bnbPool > reward + estimatedGasFee)
+			{
+				reward += estimatedGasFee;
+			}
+		}
+
+		return reward;
 	}
 
 
@@ -380,16 +401,17 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 	}
 
 	function setPancakeSwapRouter(address routerAddress) public onlyOwner {
-		_pancakeSwapRouterAddress = routerAddress; //Value will be: 0x10ed43c718714eb63d5aa57b78b54704e256024e
+		_pancakeSwapRouterAddress = routerAddress; 
 		_pancakeswapV2Router = IPancakeRouter02(_pancakeSwapRouterAddress);
 		_pancakeswapV2Pair = IPancakeFactory(_pancakeswapV2Router.factory()).createPair(address(this), _pancakeswapV2Router.WETH());
 	}
 
+	// This function can also be used in case the fees of the contract need to be adjusted later on as the volume grows
 	function setFees(uint8 liquidityFee, uint8 rewardFee, uint8 distributionFee) public onlyOwner 
 	{
-		require(liquidityFee >= 1 && liquidityFee <= 6 , "Liquidity fee must be between 1 and 6");
-		require(rewardFee >= 1 && rewardFee <= 15 , "Reward fee must be between 1 and 6");
-		require(distributionFee >= 1 && distributionFee <= 2, "Distribution fee must be between 1 and 2");
+		require(liquidityFee >= 1 && liquidityFee <= 6, "Liquidity fee must be between 1% and 6%");
+		require(rewardFee >= 1 && rewardFee <= 15, "Reward fee must be between 1% and 15%");
+		require(distributionFee >= 0 && distributionFee <= 2, "Distribution fee must be between 0% and 2%");
 		require(liquidityFee + rewardFee + distributionFee <= 15, "Total fees cannot exceed 15%");
 
 		_distributionFee = distributionFee;
@@ -397,8 +419,44 @@ contract StellarDiamond is Context, IERC20Metadata, Ownable, ReentrancyGuard {
 		_rewardFee = rewardFee;
 		
 		// Enforce invariant
-		_poolFee = _rewardFee + _liquidityFee;
+		_poolFee = _rewardFee + _liquidityFee; 
 	}
+
+	// This function will be used to reduce the limit later on, according to the price of the token
+	function setTransactionLimit(uint256 limit) public onlyOwner {
+		require(limit >= 100, "Limit must be less than or equal to 1%");
+		_maxTransactionAmount = _totalTokens / limit;
+	}
+
+	// This can be used for integration with other contracts after partnerships (e.g. reward claiming from sub-tokens)
+	function setNextAvailableClaimDate(address ofAddress, uint256 date) public onlyOwner {
+		require(date > block.timestamp, "Cannot be a date in the past");
+		require(date < block.timestamp + 31 days, "Cannot be more than 31 days in the future");
+
+		_nextAvailableClaimDate[ofAddress] = date;
+	}
+
+	function setRewardCycleExtensionThreshold(uint256 threshold) public onlyOwner {
+		_rewardCycleExtensionThreshold = threshold;
+	}
+
+
+	function claimRewardGasFeeEstimation() public view returns (uint256) {
+		return _claimRewardGasFeeEstimation;
+	}
+
+
+	function claimRewardGasFeeRefundThreshold() public view returns (uint256) {
+		return _claimRewardGasFeeRefundThreshold;
+	}
+
+
+	function setClaimRewardGasFeeOptions(uint256 threshold, uint256 gasFee) public onlyOwner 
+	{
+		_claimRewardGasFeeRefundThreshold = threshold;
+		_claimRewardGasFeeEstimation = gasFee;
+	}
+
 
 	function nextAvailableClaimDate(address ofAddress) public view returns (uint256) {
 		return _nextAvailableClaimDate[ofAddress];
