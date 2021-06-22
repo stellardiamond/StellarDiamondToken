@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.8.4;
+pragma solidity 0.8.5;
 
 import "../utils/Context.sol";
 
@@ -54,9 +54,6 @@ abstract contract Ownable is Context {
      */
     function renounceOwnership() public virtual onlyOwner {
         emit OwnershipTransferred(_owner, address(0));
-        onOwnershipRenounced(_owner);
         _owner = address(0);
     }
-
-    function onOwnershipRenounced(address previousOwner) internal virtual { }
 }
