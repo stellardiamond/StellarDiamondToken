@@ -32,11 +32,12 @@ contract StellarDiamond is StellarDiamondBase {
 
 	// AUTO-CLAIM
 	bool private _autoClaimEnabled;
-	uint256 private _maxGasForAutoClaim = 300000; // The maximum gas to consume for processing the auto-claim queue
+	uint256 private _maxGasForAutoClaim = 600000; // The maximum gas to consume for processing the auto-claim queue
 	address[] _rewardClaimQueue;
 	mapping(address => uint) _rewardClaimQueueIndices;
 	uint256 private _rewardClaimQueueIndex;
 	mapping(address => bool) _addressesInRewardClaimQueue; // Mapping between addresses and false/true depending on whether they are queued up for auto-claim or not
+	bool private _reimburseAfterXLDClaimFailure = true; // If true, and XLD reward claim portion fails, users will be rewarded whole portion in BNB
 
 	event RewardClaimed(address recipient, uint256 amountBnb, uint256 amountTokens, uint256 nextAvailableClaimDate);
 	event Burned(uint256 bnbAmount);
@@ -59,48 +60,65 @@ contract StellarDiamond is StellarDiamondBase {
 
 		setRewardAsTokensEnabled(true);
 		setAutoClaimEnabled(true);
-		setMinRewardBalance(totalSupply() / 100000);  //At least 0.001% is required to be eligible for rewards
+		setMinRewardBalance(10000);  //At least 10000 tokens are required to be eligible for rewards
 		setGradualBurnMagnitude(1); //Buy tokens using 0.01% of reward pool every 7 days and burn them
 		_lastBurnDate = block.timestamp;
 	}
 
+	function onBeforeTransfer(address sender, address recipient, uint256 amount) internal override {
+        super.onBeforeTransfer(sender, recipient, amount);
 
-    function onTransfer(address sender, address recipient, uint256 amount) internal override {
-        super.onTransfer(sender, recipient, amount);
-
-		// Process gradual burns
-		processGradualBurn();
+		if (_isSwappingTokens || isSwapTransfer(sender, recipient)) {
+			return;
+		}
 
         // Extend the reward cycle according to the amount transferred.  This is done so that users do not abuse the cycle (buy before it ends & sell after they claim the reward)
 		_nextAvailableClaimDate[recipient] += calculateRewardCycleExtension(balanceOf(recipient), amount);
 		_nextAvailableClaimDate[sender] += calculateRewardCycleExtension(balanceOf(sender), amount);
 		
-        // Update auto-claim queue
-		updateAutoClaimQueue(sender);
-		updateAutoClaimQueue(recipient);
+		bool isSelling = isPancakeSwapPair(recipient);
+		if (!isSelling) {
+			return;
+		}
+
+		// Process gradual burns
+		if (processGradualBurn()) {
+			return;
+		}
 
         // Trigger auto-claim
-		if (isAutoClaimEnabled() && !isSwapTransfer(sender, recipient)) {
+		if (isAutoClaimEnabled()) {
 	    	try this.processRewardClaimQueue(_maxGasForAutoClaim) { } catch { }
 		}
     }
 
 
-	function processGradualBurn() private {
+	function onTransfer(address sender, address recipient, uint256 amount) internal override {
+        super.onTransfer(sender, recipient, amount);
+
+		if (!_isSwappingTokens && !isSwapTransfer(sender, recipient)) {
+			// Update auto-claim queue after balances have been updated
+			updateAutoClaimQueue(sender);
+			updateAutoClaimQueue(recipient);
+		}
+    }
+	
+	
+	function processGradualBurn() private returns(bool) {
 		if (!shouldBurn()) {
-			return;
+			return false;
 		}
 
 		uint256 burnAmount = address(this).balance * _gradualBurnMagnitude / 10000;
 		doBuyAndBurn(burnAmount);
+		return true;
 	}
 
 
 	function updateAutoClaimQueue(address user) private {
 		bool isQueued = _addressesInRewardClaimQueue[user];
-		bool includedInRewards = balanceOf(user) >= _minRewardBalance && !_addressesExcludedFromRewards[user];
 
-		if (includedInRewards) {
+		if (!isIncludedInRewards(user)) {
 			if (isQueued) {
 				// Need to dequeue
 				uint index = _rewardClaimQueueIndices[user];
@@ -134,8 +152,7 @@ contract StellarDiamond is StellarDiamondBase {
 	function claimReward(address user) public {
 		require(msg.sender == user || isClaimApproved(user, msg.sender), "You are not allowed to claim rewards on behalf of this user");
 		require(isRewardReady(user), "Claim date for this address has not passed yet");
-		require(balanceOf(user) > _minRewardBalance, "The address must own XLD before claiming a reward");
-		require(!_addressesExcludedFromRewards[user], "Address is excluded from rewards");
+		require(isIncludedInRewards(user), "Address is excluded from rewards, make sure there is enough XLD balance");
 
 		bool success = doClaimReward(user);
 		require(success, "Reward claim failed");
@@ -148,15 +165,28 @@ contract StellarDiamond is StellarDiamondBase {
 
 		(uint256 claimBnb, uint256 claimBnbAsTokens) = calculateClaimRewards(user);
 
-        // Claim BNB & tokens
-		bool success = claimXLD(user, claimBnbAsTokens) && claimBNB(user, claimBnb);
+		bool tokenClaimSuccess = true;
+        // Claim XLD tokens
+		if (!claimXLD(user, claimBnbAsTokens)) {
+			// If token claim fails for any reason, award whole portion as BNB
+			if (_reimburseAfterXLDClaimFailure) {
+				claimBnb += claimBnbAsTokens;
+			} else {
+				tokenClaimSuccess = false;
+			}
 
-		// Fire the event
-		if (success) {
+			claimBnbAsTokens = 0;
+		}
+
+		// Claim BNB
+		bool bnbClaimSuccess = claimBNB(user, claimBnb);
+
+		// Fire the event in case something was claimed
+		if (tokenClaimSuccess || bnbClaimSuccess) {
 			emit RewardClaimed(user, claimBnb, claimBnbAsTokens, _nextAvailableClaimDate[user]);
 		}
 		
-		return success;
+		return bnbClaimSuccess && tokenClaimSuccess;
 	}
 
 
@@ -182,7 +212,7 @@ contract StellarDiamond is StellarDiamondBase {
 			return true;
 		}
 
-		bool success = swapBNBForTokens(bnbAmount, address(this), user);
+		bool success = swapBNBForTokens(bnbAmount, user);
 		if (!success) {
 			return false;
 		}
@@ -196,9 +226,9 @@ contract StellarDiamond is StellarDiamondBase {
 	function processRewardClaimQueue(uint256 gas) public {
 		require(gas > 0, "Gas limit is required");
 
-		uint256 numberOfHolders = _rewardClaimQueue.length;
+		uint256 queueLength = _rewardClaimQueue.length;
 
-		if (numberOfHolders == 0) {
+		if (queueLength == 0) {
 			return;
 		}
 
@@ -207,13 +237,13 @@ contract StellarDiamond is StellarDiamondBase {
 		uint256 iteration = 0;
 
 		// Keep claiming rewards from the list until we either consume all available gas or we finish one cycle
-		while (gasUsed < gas && iteration < numberOfHolders) {
-			if (_rewardClaimQueueIndex >= numberOfHolders) {
+		while (gasUsed < gas && iteration < queueLength) {
+			if (_rewardClaimQueueIndex >= queueLength) {
 				_rewardClaimQueueIndex = 0;
 			}
 
 			address user = _rewardClaimQueue[_rewardClaimQueueIndex];
-			if (isRewardReady(user)) {
+			if (isRewardReady(user) && isIncludedInRewards(user)) {
 				doClaimReward(user);
 			}
 
@@ -233,6 +263,11 @@ contract StellarDiamond is StellarDiamondBase {
 
 	function isRewardReady(address user) public view returns(bool) {
 		return _nextAvailableClaimDate[user] <= block.timestamp;
+	}
+
+
+	function isIncludedInRewards(address user) public view returns(bool) {
+		return balanceOf(user) >= _minRewardBalance && !_addressesExcludedFromRewards[user];
 	}
 
 
@@ -287,6 +322,8 @@ contract StellarDiamond is StellarDiamondBase {
 
 		uint256 balance = balanceOf(ofAddress);
 		uint256 bnbPool =  address(this).balance * (100 - _globalRewardDampeningPercentage) / 100;
+
+		// Limit to main pool size.  The rest of the pool is used as a reserve to improve consistency
 		if (bnbPool > _mainBnbPoolSize) {
 			bnbPool = _mainBnbPoolSize;
 		}
@@ -328,19 +365,29 @@ contract StellarDiamond is StellarDiamondBase {
 
 		require(bnbAmount < address(this).balance, "Not enough balance");
 
-		swapBNBForTokens(bnbAmount, address(this), BURN_WALLET);
+		swapBNBForTokens(bnbAmount, BURN_WALLET);
 		_lastBurnDate = block.timestamp;
 		emit Burned(bnbAmount);
 	}
 
 
-    function rewardsClaimed(address byAddress) public view returns (uint256) {
+    function bnbRewardClaimed(address byAddress) public view returns (uint256) {
 		return _bnbRewardClaimed[byAddress];
+	}
+
+
+    function bnbRewardClaimedAsXLD(address byAddress) public view returns (uint256) {
+		return _bnbAsXLDClaimed[byAddress];
 	}
 
 
     function totalBNBClaimed() public view returns (uint256) {
 		return _totalBNBClaimed;
+	}
+
+
+    function totalBNBClaimedAsXLD() public view returns (uint256) {
+		return _totalBNBAsXLDClaimed;
 	}
 
 
@@ -487,9 +534,9 @@ contract StellarDiamond is StellarDiamondBase {
 	}
 
 
-	function setClaimRewardAsTokensPercentage(uint256 amount) public {
-		require(amount <= 100, "Cannot exceed 100%");
-		_claimRewardAsTokensPercentage[msg.sender] = amount;
+	function setClaimRewardAsTokensPercentage(uint256 percentage) public {
+		require(percentage <= 100, "Cannot exceed 100%");
+		_claimRewardAsTokensPercentage[msg.sender] = percentage;
 	}
 
 
@@ -501,5 +548,30 @@ contract StellarDiamond is StellarDiamondBase {
 	function setMainBnbPoolSize(uint256 size) public onlyOwner {
 		require(size >= 1 ether, "Size is too small");
 		_mainBnbPoolSize = size;
+	}
+
+
+	function isInRewardClaimQueue(address addr) public view returns(bool) {
+		return _addressesInRewardClaimQueue[addr];
+	}
+
+	
+	function reimburseAfterXLDClaimFailure() public view returns(bool) {
+		return _reimburseAfterXLDClaimFailure;
+	}
+
+
+	function setReimburseAfterXLDClaimFailure(bool value) public onlyOwner {
+		_reimburseAfterXLDClaimFailure = value;
+	}
+
+
+	function lastBurnDate() public view returns(uint256) {
+		return _lastBurnDate;
+	}
+
+
+	function rewardClaimQueueLength() public view returns(uint256) {
+		return _rewardClaimQueue.length;
 	}
 }

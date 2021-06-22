@@ -30,10 +30,10 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	bool private _isFeeEnabled; // True if fees should be applied on transactions, false otherwise
 	address public constant BURN_WALLET = 0x000000000000000000000000000000000000dEaD; //The address that keeps track of all tokens burned
 	uint256 private _tokenSwapThreshold = _totalTokens / 100000; //There should be at least 0.0001% of the total supply in the contract before triggering a swap
-	uint256 private _totalFeesDistributed; // The total fees distributed (in number of tokens)
 	uint256 private _totalFeesPooled; // The total fees pooled (in number of tokens)
 	uint256 private _totalBNBLiquidityAddedFromFees; // The total number of BNB added to the pool through fees
 	mapping (address => bool) private _addressesExcludedFromFees; // The list of addresses that do not pay a fee for transactions
+	bool internal _isSwappingTokens;
 
 	// TRANSACTION LIMIT
 	uint256 private _maxTransactionAmount = _totalTokens; // The amount of tokens that can be sold at once
@@ -77,6 +77,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 	function onActivated() internal virtual { }
 
+
 	function balanceOf(address account) public view override returns (uint256) {
 		return _balances[account];
 	}
@@ -106,7 +107,6 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		require(recipient != address(0), "Transfer to the zero address is not allowed");
 		require(amount > 0, "Transfer amount must be greater than zero");
 		
-		
 		// Ensure that amount is within the limit in case we are selling
 		if (isTransferLimited(sender, recipient)) {
 			require(amount <= _maxTransactionAmount, "Transfer amount exceeds the maximum allowed");
@@ -114,6 +114,8 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 		// Perform a swap if needed.  A swap in the context of this contract is the process of swapping the contract's token balance with BNBs in order to provide liquidity and increase the reward pool
 		executeSwapIfNeeded(sender, recipient);
+
+		onBeforeTransfer(sender, recipient, amount);
 
 		// Calculate fee rate
 		uint256 feeRate = calculateFeeRate(sender, recipient);
@@ -124,7 +126,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		// Update balances
 		updateBalances(sender, recipient, amount, feeAmount);
 
-		// Update total fees, these is just a counter provided for visibility
+		// Update total fees, this is just a counter provided for visibility
 		_totalFeesPooled += feeAmount;
 
 		emit Transfer(sender, recipient, transferAmount); 
@@ -132,6 +134,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		onTransfer(sender, recipient, amount);
 	}
 
+	function onBeforeTransfer(address sender, address recipient, uint256 amount) internal virtual { }
 
 	function onTransfer(address sender, address recipient, uint256 amount) internal virtual { }
 
@@ -174,7 +177,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 	
 	function executeSwapIfNeeded(address sender, address recipient) private {
-		if (!_isSwapEnabled) {
+		if (!_isSwapEnabled || _isSwappingTokens) {
 			return;
 		}
 
@@ -186,7 +189,8 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 			tokensAvailableForSwap = _tokenSwapThreshold;
 
 			// Make sure that we are not stuck in a loop (Swap only once)
-			if (!isSwapTransfer(sender, recipient)) {
+			bool isSelling = isPancakeSwapPair(recipient);
+			if (!isSwapTransfer(sender, recipient) && isSelling) {
 				executeSwap(tokensAvailableForSwap);
 			}
 		}
@@ -222,14 +226,13 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 	function isTransferLimited(address sender, address recipient) private view returns(bool) {
 		bool isSelling = isPancakeSwapPair(recipient);
-		return isSelling && !isSwapTransfer(sender, recipient);
+		return isSelling && !isSwapTransfer(sender, recipient) && !_isSwappingTokens;
 	}
 
 
 	function isSwapTransfer(address sender, address recipient) public view returns(bool) {
 		bool isContractSelling = sender == address(this) && isPancakeSwapPair(recipient);
-		bool isRouterRemovingLiq = sender == _pancakeSwapRouterAddress;
-		return !isContractSelling && !isRouterRemovingLiq;
+		return isContractSelling;
 	}
 	
 	
@@ -250,16 +253,21 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	}
 
 
-	function swapBNBForTokens(uint256 bnbAmount, address tokenAddress, address to) internal returns(bool) {
+	function swapBNBForTokens(uint256 bnbAmount, address to) internal returns(bool) { 
+		// Generate pair for WBNB -> XLD
 		address[] memory path = new address[](2);
-		path[0] = tokenAddress;
-		path[1] = _pancakeswapV2Router.WETH();
+		path[0] = _pancakeswapV2Router.WETH();
+		path[1] = address(this);
 
 
+		// Swap, set flag _isSwappingTokens to avoid dealing with swaps or other auto-claim processing etc
+		_isSwappingTokens = true;
 		try _pancakeswapV2Router.swapExactETHForTokensSupportingFeeOnTransferTokens{ value: bnbAmount }(0, path, to, block.timestamp + 360) { 
+			_isSwappingTokens = false;
 			return true;
 		} 
 		catch { 
+			_isSwappingTokens = false;
 			return false;
 		}
 	}
@@ -309,10 +317,10 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 	// This function can also be used in case the fees of the contract need to be adjusted later on as the volume grows
 	function setFees(uint8 liquidityFee, uint8 rewardFee, uint8 additionalSellFee) public onlyOwner {
-		require(liquidityFee >= 1 && liquidityFee <= 6, "Liquidity fee must be between 1% and 6%");
+		require(liquidityFee >= 1 && liquidityFee <= 8, "Liquidity fee must be between 1% and 8%");
 		require(rewardFee >= 1 && rewardFee <= 15, "Reward fee must be between 1% and 15%");
 		require(additionalSellFee <= 5, "Additional sell fee cannot exceed 5%");
-		require(liquidityFee + rewardFee + additionalSellFee <= 20, "Total fees cannot exceed 20%");
+		require(liquidityFee + rewardFee + additionalSellFee <= 25, "Total fees cannot exceed 25%");
 		
 		_liquidityFee = liquidityFee;
 		_rewardFee = rewardFee;
@@ -353,11 +361,6 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 	function decimals() public override pure returns (uint8) {
 		return DECIMALS;
-	}
-	
-
-	function totalFeesDistributed() public view returns (uint256) {
-		return _totalFeesDistributed;
 	}
 	
 
@@ -435,6 +438,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	function setExcludedFromFees(address addr, bool value) public onlyOwner {
 		_addressesExcludedFromFees[addr] = value;
 	}
+
 
 	// Ensures that the contract is able to receive BNB
 	receive() external payable {}
