@@ -8,3 +8,6 @@ contract("StellarDiamond", accounts => {
         assert.equal(balance.valueOf(), instance.totalSupply());
     });
 });
+
+
+// Automated tests written in C# outside of this project
