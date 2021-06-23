@@ -18,7 +18,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	uint8 private constant DECIMALS = 9;
 	uint8 private _liquidityFee; //% of each transaction that will be added as liquidity
 	uint8 private _rewardFee; //% of each transaction that will be used for BNB reward pool
-	uint8 private _additionalSellFee; //Additional % fee to apply on sell transactions
+	uint8 private _additionalSellFee; //Additional % fee to apply on sell transactions. Half of it will go to liquidity, other half to rewards
 	uint8 private _poolFee; //The total fee to be taken and added to the pool, this includes both the liquidity fee and the reward fee
 
 	uint256 private constant _totalTokens = 1000000000000 * 10**DECIMALS;	//1 trillion total supply
@@ -33,10 +33,11 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	uint256 private _totalFeesPooled; // The total fees pooled (in number of tokens)
 	uint256 private _totalBNBLiquidityAddedFromFees; // The total number of BNB added to the pool through fees
 	mapping (address => bool) private _addressesExcludedFromFees; // The list of addresses that do not pay a fee for transactions
-	bool internal _isSwappingTokens;
 
 	// TRANSACTION LIMIT
-	uint256 private _maxTransactionAmount = _totalTokens; // The amount of tokens that can be sold at once
+	uint256 private _transactionLimit = _totalTokens; // The amount of tokens that can be sold at once
+	bool private _isBuyingAllowed; // This is used to make sure that the contract is activated before anyone makes a purchase on PCS.  The contract will be activated once liquidity is added.
+
 
 	// PANCAKESWAP INTERFACES (For swaps)
 	address private _pancakeSwapRouterAddress;
@@ -70,7 +71,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		setFeeEnabled(true);
 		setAutoLiquidityWallet(owner());
 		setTransactionLimit(1000); // only 0.1% of the total supply can be sold at once
-
+		activateBuying();
 		onActivated();
 	}
 
@@ -106,10 +107,11 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		require(sender != address(0), "Transfer from the zero address is not allowed");
 		require(recipient != address(0), "Transfer to the zero address is not allowed");
 		require(amount > 0, "Transfer amount must be greater than zero");
+		require(!isPancakeSwapPair(sender) || _isBuyingAllowed, "Buying is not allowed before contract activation");
 		
 		// Ensure that amount is within the limit in case we are selling
 		if (isTransferLimited(sender, recipient)) {
-			require(amount <= _maxTransactionAmount, "Transfer amount exceeds the maximum allowed");
+			require(amount <= _transactionLimit, "Transfer amount exceeds the maximum allowed");
 		}
 
 		// Perform a swap if needed.  A swap in the context of this contract is the process of swapping the contract's token balance with BNBs in order to provide liquidity and increase the reward pool
@@ -166,6 +168,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		bool applyFees = _isFeeEnabled && !_addressesExcludedFromFees[sender] && !_addressesExcludedFromFees[recipient];
 		if (applyFees) {
 			if (isPancakeSwapPair(recipient)) {
+				// Additional fee when selling
 				return _poolFee + _additionalSellFee;
 			}
 
@@ -177,7 +180,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 	
 	function executeSwapIfNeeded(address sender, address recipient) private {
-		if (!_isSwapEnabled || _isSwappingTokens) {
+		if (!isMarketTransfer(sender, recipient)) {
 			return;
 		}
 
@@ -190,7 +193,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 
 			// Make sure that we are not stuck in a loop (Swap only once)
 			bool isSelling = isPancakeSwapPair(recipient);
-			if (!isSwapTransfer(sender, recipient) && isSelling) {
+			if (isSelling) {
 				executeSwap(tokensAvailableForSwap);
 			}
 		}
@@ -224,18 +227,6 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	}
 
 
-	function isTransferLimited(address sender, address recipient) private view returns(bool) {
-		bool isSelling = isPancakeSwapPair(recipient);
-		return isSelling && !isSwapTransfer(sender, recipient) && !_isSwappingTokens;
-	}
-
-
-	function isSwapTransfer(address sender, address recipient) public view returns(bool) {
-		bool isContractSelling = sender == address(this) && isPancakeSwapPair(recipient);
-		return isContractSelling;
-	}
-	
-	
 	// This function swaps a {tokenAmount} of XLD tokens for BNB and returns the total amount of BNB received
 	function swapTokensForBNB(uint256 tokenAmount) internal returns(uint256) {
 		uint256 initialBalance = address(this).balance;
@@ -260,16 +251,32 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		path[1] = address(this);
 
 
-		// Swap, set flag _isSwappingTokens to avoid dealing with swaps or other auto-claim processing etc
-		_isSwappingTokens = true;
+		// Swap and send the tokens to the 'to' address
 		try _pancakeswapV2Router.swapExactETHForTokensSupportingFeeOnTransferTokens{ value: bnbAmount }(0, path, to, block.timestamp + 360) { 
-			_isSwappingTokens = false;
 			return true;
 		} 
 		catch { 
-			_isSwappingTokens = false;
 			return false;
 		}
+	}
+
+	
+	// Returns true if the transfer between the two given addresses should be limited by the transaction limit and false otherwise
+	function isTransferLimited(address sender, address recipient) private view returns(bool) {
+		bool isSelling = isPancakeSwapPair(recipient);
+		return isSelling && isMarketTransfer(sender, recipient);
+	}
+
+
+	function isSwapTransfer(address sender, address recipient) private view returns(bool) {
+		bool isContractSelling = sender == address(this) && isPancakeSwapPair(recipient);
+		return isContractSelling;
+	}
+
+
+	// Function that is used to determine whether a transfer occurred due to a user buying/selling/transfering and not due to the contract swapping tokens
+	function isMarketTransfer(address sender, address recipient) internal virtual view returns(bool) {
+		return !isSwapTransfer(sender, recipient);
 	}
 
 
@@ -296,6 +303,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		return true;
 	}
 
+
 	function setPancakeSwapRouter(address routerAddress) public onlyOwner {
 		require(routerAddress != address(0), "Cannot use the zero address as router address");
 
@@ -310,7 +318,7 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	function onPancakeSwapRouterUpdated() internal virtual { }
 
 
-	function isPancakeSwapPair(address addr) public view returns(bool) {
+	function isPancakeSwapPair(address addr) internal view returns(bool) {
 		return _pancakeswapV2Pair == addr;
 	}
 
@@ -331,16 +339,26 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	}
 
 
-	// This function will be used to reduce the limit later on, according to the price of the token
+	// This function will be used to reduce the limit later on, according to the price of the token, 100 = 1%, 1000 = 0.1% ...
 	function setTransactionLimit(uint256 limit) public onlyOwner {
 		require(limit >= 1 && limit <= 10000, "Limit must be greater than 0.01%");
-		_maxTransactionAmount = _totalTokens / limit;
+		_transactionLimit = _totalTokens / limit;
+	}
+
+		
+	function transactionLimit() public view returns (uint256) {
+		return _transactionLimit;
 	}
 
 
 	function setTokenSwapThreshold(uint256 threshold) public onlyOwner {
 		require(threshold > 0, "Threshold must be greater than 0");
 		_tokenSwapThreshold = threshold;
+	}
+
+
+	function tokenSwapThreshold() public view returns (uint256) {
+		return _tokenSwapThreshold;
 	}
 
 
@@ -368,11 +386,6 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		return _allowances[user][spender];
 	}
 
-	
-	function maxTransactionAmount() public view returns (uint256) {
-		return _maxTransactionAmount;
-	}
-
 
 	function pancakeSwapRouterAddress() public view returns (address) {
 		return _pancakeSwapRouterAddress;
@@ -397,12 +410,6 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 	function totalFeesPooled() public view returns (uint256) {
 		return _totalFeesPooled;
 	}
-
-
-	function totalAmountOfTokensHeld() public view returns (uint256) {
-		return _totalTokens - balanceOf(address(0)) - balanceOf(BURN_WALLET) - balanceOf(_pancakeswapV2Pair);
-	}
-
 
 	
 	function totalBNBLiquidityAddedFromFees() public view returns (uint256) {
@@ -439,6 +446,10 @@ abstract contract StellarDiamondBase is Context, IERC20Metadata, Ownable, Reentr
 		_addressesExcludedFromFees[addr] = value;
 	}
 
+
+	function activateBuying() public onlyOwner {
+		_isBuyingAllowed = true;
+	}
 
 	// Ensures that the contract is able to receive BNB
 	receive() external payable {}

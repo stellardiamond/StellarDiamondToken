@@ -5,6 +5,8 @@ pragma solidity 0.8.5;
 
 import "./StellarDiamondBase.sol";
 
+
+// Implements rewards & burns
 contract StellarDiamond is StellarDiamondBase {
 
 	// REWARD CYCLE
@@ -26,9 +28,9 @@ contract StellarDiamond is StellarDiamondBase {
 	uint256 private _mainBnbPoolSize = 10000 ether; // Any excess BNB after the main pool will be used as reserves to ensure consistency in rewards
 	bool private _rewardAsTokensEnabled; //If enabled, the contract will give out tokens instead of BNB according to the preference of each user
 	uint256 private _gradualBurnMagnitude; // The contract can optionally burn tokens (By buying them from reward pool).  This is the magnitude of the burn (1 = 0.01%).
-	uint256 private _gradualBurnTimespan = 7 days; //Burn every 7 days
+	uint256 private _gradualBurnTimespan = 1 days; //Burn every 1 day by default
 	uint256 private _lastBurnDate; //The last burn date
-	uint256 private _minBnbPoolSizeBeforeBurn = 100 ether; //The minimum amount of BNB that need to be in the pool before initiating gradual burns
+	uint256 private _minBnbPoolSizeBeforeBurn = 10 ether; //The minimum amount of BNB that need to be in the pool before initiating gradual burns
 
 	// AUTO-CLAIM
 	bool private _autoClaimEnabled;
@@ -37,7 +39,9 @@ contract StellarDiamond is StellarDiamondBase {
 	mapping(address => uint) _rewardClaimQueueIndices;
 	uint256 private _rewardClaimQueueIndex;
 	mapping(address => bool) _addressesInRewardClaimQueue; // Mapping between addresses and false/true depending on whether they are queued up for auto-claim or not
-	bool private _reimburseAfterXLDClaimFailure = true; // If true, and XLD reward claim portion fails, users will be rewarded whole portion in BNB
+	bool private _reimburseAfterXLDClaimFailure; // If true, and XLD reward claim portion fails, the portion will be given as BNB instead
+	bool private _processingQueue; //Flag that indicates whether the queue is currently being processed and sending out rewards
+	mapping(address => bool) private _whitelistedExternalProcessors; //Contains a list of addresses that are whitelisted for low-gas queue processing 
 
 	event RewardClaimed(address recipient, uint256 amountBnb, uint256 amountTokens, uint256 nextAvailableClaimDate);
 	event Burned(uint256 bnbAmount);
@@ -60,15 +64,16 @@ contract StellarDiamond is StellarDiamondBase {
 
 		setRewardAsTokensEnabled(true);
 		setAutoClaimEnabled(true);
-		setMinRewardBalance(10000);  //At least 10000 tokens are required to be eligible for rewards
-		setGradualBurnMagnitude(1); //Buy tokens using 0.01% of reward pool every 7 days and burn them
+		setReimburseAfterXLDClaimFailure(true);
+		setMinRewardBalance(5000);  //At least 5000 tokens are required to be eligible for rewards
+		setGradualBurnMagnitude(1); //Buy tokens using 0.01% of reward pool and burn them
 		_lastBurnDate = block.timestamp;
 	}
 
 	function onBeforeTransfer(address sender, address recipient, uint256 amount) internal override {
         super.onBeforeTransfer(sender, recipient, amount);
 
-		if (_isSwappingTokens || isSwapTransfer(sender, recipient)) {
+		if (!isMarketTransfer(sender, recipient)) {
 			return;
 		}
 
@@ -78,17 +83,17 @@ contract StellarDiamond is StellarDiamondBase {
 		
 		bool isSelling = isPancakeSwapPair(recipient);
 		if (!isSelling) {
+			// Wait for a dip, stellar diamond hands
 			return;
 		}
 
 		// Process gradual burns
-		if (processGradualBurn()) {
-			return;
-		}
+		bool burnTriggered = processGradualBurn();
 
-        // Trigger auto-claim
-		if (isAutoClaimEnabled()) {
-	    	try this.processRewardClaimQueue(_maxGasForAutoClaim) { } catch { }
+		// Do not burn & process queue in the same transaction
+		if (!burnTriggered && isAutoClaimEnabled()) {
+			// Trigger auto-claim
+			try this.processRewardClaimQueue(_maxGasForAutoClaim) { } catch { }
 		}
     }
 
@@ -96,11 +101,13 @@ contract StellarDiamond is StellarDiamondBase {
 	function onTransfer(address sender, address recipient, uint256 amount) internal override {
         super.onTransfer(sender, recipient, amount);
 
-		if (!_isSwappingTokens && !isSwapTransfer(sender, recipient)) {
-			// Update auto-claim queue after balances have been updated
-			updateAutoClaimQueue(sender);
-			updateAutoClaimQueue(recipient);
+		if (!isMarketTransfer(sender, recipient)) {
+			return;
 		}
+
+		// Update auto-claim queue after balances have been updated
+		updateAutoClaimQueue(sender);
+		updateAutoClaimQueue(recipient);
     }
 	
 	
@@ -223,6 +230,9 @@ contract StellarDiamond is StellarDiamondBase {
 	}
 
 
+	// Processes users in the claim queue and sends out rewards when applicable. The amount of users processed depends on the gas provided, up to 1 cycle through the whole queue. 
+	// Note: Any external processor can process the claim queue (e.g. even if auto claim is disabled from the contract, an external contract/user/service can process the queue for it 
+	// and pay the gas cost). "gas" parameter is the maximum amount of gas allowed to be consumed
 	function processRewardClaimQueue(uint256 gas) public {
 		require(gas > 0, "Gas limit is required");
 
@@ -235,6 +245,7 @@ contract StellarDiamond is StellarDiamondBase {
 		uint256 gasUsed = 0;
 		uint256 gasLeft = gasleft();
 		uint256 iteration = 0;
+		_processingQueue = true;
 
 		// Keep claiming rewards from the list until we either consume all available gas or we finish one cycle
 		while (gasUsed < gas && iteration < queueLength) {
@@ -258,6 +269,21 @@ contract StellarDiamond is StellarDiamondBase {
 			iteration++;
 			_rewardClaimQueueIndex++;
 		}
+
+		_processingQueue = false;
+	}
+
+	// Allows a whitelisted external contract/user/service to process the queue and have a portion of the gas costs refunded.
+	// This can be used to help with transaction fees and payout response time when/if the queue grows too big for the contract.
+	// "gas" parameter is the maximum amount of gas allowed to be used.
+	function processRewardClaimQueueAndRefundGas(uint256 gas) external {
+		require(_whitelistedExternalProcessors[msg.sender], "Not whitelisted - use processRewardClaimQueue instead");
+
+		uint256 startGas = gasleft();
+		processRewardClaimQueue(gas);
+		uint256 gasUsed = startGas - gasleft();
+
+		payable(msg.sender).transfer(gasUsed);
 	}
 
 
@@ -345,13 +371,25 @@ contract StellarDiamond is StellarDiamondBase {
 	}
 
 
+	function isMarketTransfer(address sender, address recipient) internal override view returns(bool) {
+		// Not a market transfer when we are burning or sending out rewards
+		return super.isMarketTransfer(sender, recipient) && !isBurnTransfer(sender, recipient) && !_processingQueue;
+	}
+
+
+	function isBurnTransfer(address sender, address recipient) private view returns (bool) {
+		return isPancakeSwapPair(sender) && recipient == BURN_WALLET;
+	}
+
+
 	function shouldBurn() public view returns(bool) {
 		return _gradualBurnMagnitude > 0 && address(this).balance >= _minBnbPoolSizeBeforeBurn && block.timestamp - _lastBurnDate > _gradualBurnTimespan;
 	}
 
 
+	// Up to 1% manual buyback & burn
 	function buyAndBurn(uint256 bnbAmount) external onlyOwner {
-		require(bnbAmount <= address(this).balance / 10, "Burn is too high");
+		require(bnbAmount <= address(this).balance / 100, "Manual burn amount is too high!");
 		require(bnbAmount > 0, "Amount must be greater than zero");
 
 		doBuyAndBurn(bnbAmount);
@@ -359,15 +397,24 @@ contract StellarDiamond is StellarDiamondBase {
 
 
 	function doBuyAndBurn(uint256 bnbAmount) private {
+		if (bnbAmount > address(this).balance) {
+			bnbAmount = address(this).balance;
+		}
+
 		if (bnbAmount == 0) {
 			return;
 		}
 
-		require(bnbAmount < address(this).balance, "Not enough balance");
+		if (swapBNBForTokens(bnbAmount, BURN_WALLET)) {
+			emit Burned(bnbAmount);
+		}
 
-		swapBNBForTokens(bnbAmount, BURN_WALLET);
 		_lastBurnDate = block.timestamp;
-		emit Burned(bnbAmount);
+	}
+
+
+	function totalAmountOfTokensHeld() public view returns (uint256) {
+		return totalSupply() - balanceOf(address(0)) - balanceOf(BURN_WALLET) - balanceOf(pancakeSwapPairAddress());
 	}
 
 
@@ -476,13 +523,14 @@ contract StellarDiamond is StellarDiamondBase {
 	}
 
 
-	function approveClaim(address from, bool isApproved) public {
-		_rewardClaimApprovals[msg.sender][from] = isApproved;
+	function approveClaim(address byAddress, bool isApproved) public {
+		require(byAddress != address(0), "Invalid address");
+		_rewardClaimApprovals[msg.sender][byAddress] = isApproved;
 	}
 
 
-	function isClaimApproved(address ofAddress, address from) public view returns(bool) {
-		return _rewardClaimApprovals[ofAddress][from];
+	function isClaimApproved(address ofAddress, address byAddress) public view returns(bool) {
+		return _rewardClaimApprovals[ofAddress][byAddress];
 	}
 
 
@@ -513,7 +561,7 @@ contract StellarDiamond is StellarDiamondBase {
 
 
 	function setGradualBurnTimespan(uint256 timespan) public onlyOwner {
-		require(timespan >= 1 hours, "Cannot be less than an hour");
+		require(timespan >= 5 minutes, "Cannot be less than 5 minutes");
 		_gradualBurnTimespan = timespan;
 	}
 
@@ -546,7 +594,7 @@ contract StellarDiamond is StellarDiamondBase {
 
 
 	function setMainBnbPoolSize(uint256 size) public onlyOwner {
-		require(size >= 1 ether, "Size is too small");
+		require(size >= 10 ether, "Size is too small");
 		_mainBnbPoolSize = size;
 	}
 
@@ -573,5 +621,21 @@ contract StellarDiamond is StellarDiamondBase {
 
 	function rewardClaimQueueLength() public view returns(uint256) {
 		return _rewardClaimQueue.length;
+	}
+
+
+	function rewardClaimQueueIndex() public view returns(uint256) {
+		return _rewardClaimQueueIndex;
+	}
+
+
+	function isWhitelistedExternalProcessor(address addr) public view returns(bool) {
+		return _whitelistedExternalProcessors[addr];
+	}
+
+
+	function setWhitelistedExternalProcessor(address addr, bool isWhitelisted) public onlyOwner {
+		 require(addr != address(0), "Invalid address");
+		_whitelistedExternalProcessors[addr] = isWhitelisted;
 	}
 }
