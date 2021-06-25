@@ -42,8 +42,10 @@ contract StellarDiamond is StellarDiamondBase {
 	bool private _reimburseAfterXLDClaimFailure; // If true, and XLD reward claim portion fails, the portion will be given as BNB instead
 	bool private _processingQueue; //Flag that indicates whether the queue is currently being processed and sending out rewards
 	mapping(address => bool) private _whitelistedExternalProcessors; //Contains a list of addresses that are whitelisted for low-gas queue processing 
+	uint256 private _sendWeiGasLimit;
+	bool private _excludeNonHumansFromRewards = true;
 
-	event RewardClaimed(address recipient, uint256 amountBnb, uint256 amountTokens, uint256 nextAvailableClaimDate);
+	event RewardClaimed(address recipient, uint256 amountBnb, uint256 amountTokens, uint256 nextAvailableClaimDate); 
 	event Burned(uint256 bnbAmount);
 
 	constructor (address routerAddress) StellarDiamondBase(routerAddress) {
@@ -65,7 +67,7 @@ contract StellarDiamond is StellarDiamondBase {
 		setRewardAsTokensEnabled(true);
 		setAutoClaimEnabled(true);
 		setReimburseAfterXLDClaimFailure(true);
-		setMinRewardBalance(5000);  //At least 5000 tokens are required to be eligible for rewards
+		setMinRewardBalance(5000 * 10**decimals());  //At least 5000 tokens are required to be eligible for rewards
 		setGradualBurnMagnitude(1); //Buy tokens using 0.01% of reward pool and burn them
 		_lastBurnDate = block.timestamp;
 	}
@@ -203,10 +205,18 @@ contract StellarDiamond is StellarDiamondBase {
 		}
 
 		// Send the reward to the caller
-		(bool sent,) = user.call{value : bnbAmount}("");
-		if (!sent) {
-			return false;
+		if (_sendWeiGasLimit > 0) {
+			(bool sent,) = user.call{value : bnbAmount, gas: _sendWeiGasLimit}("");
+			if (!sent) {
+				return false;
+			}
+		} else {
+			(bool sent,) = user.call{value : bnbAmount}("");
+			if (!sent) {
+				return false;
+			}
 		}
+
 	
 		_bnbRewardClaimed[user] += bnbAmount;
 		_totalBNBClaimed += bnbAmount;
@@ -293,6 +303,12 @@ contract StellarDiamond is StellarDiamondBase {
 
 
 	function isIncludedInRewards(address user) public view returns(bool) {
+		if (_excludeNonHumansFromRewards) {
+			if (isContract(user)) {
+				return false;
+			}
+		}
+
 		return balanceOf(user) >= _minRewardBalance && !_addressesExcludedFromRewards[user];
 	}
 
@@ -410,6 +426,14 @@ contract StellarDiamond is StellarDiamondBase {
 		}
 
 		_lastBurnDate = block.timestamp;
+	}
+
+
+	function isContract(address addr) public view returns (bool) {
+        uint256 size;
+        // solhint-disable-next-line no-inline-assembly
+        assembly { size := extcodesize(account) }
+        return size > 0;
 	}
 
 
@@ -637,5 +661,13 @@ contract StellarDiamond is StellarDiamondBase {
 	function setWhitelistedExternalProcessor(address addr, bool isWhitelisted) public onlyOwner {
 		 require(addr != address(0), "Invalid address");
 		_whitelistedExternalProcessors[addr] = isWhitelisted;
+	}
+
+	function setSendWeiGasLimit(uint256 amount) public onlyOwner {
+		_sendWeiGasLimit = amount;
+	}
+
+	function setExcludeNonHumansFromRewards(bool exclude) public onlyOwner {
+		_excludeNonHumansFromRewards = exclude;
 	}
 }
