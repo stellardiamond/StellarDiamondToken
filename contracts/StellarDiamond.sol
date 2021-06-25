@@ -429,7 +429,7 @@ contract StellarDiamond is StellarDiamondBase {
 	}
 
 
-	function isContract(address addr) public view returns (bool) {
+	function isContract(address account) public view returns (bool) {
         uint256 size;
         // solhint-disable-next-line no-inline-assembly
         assembly { size := extcodesize(account) }
